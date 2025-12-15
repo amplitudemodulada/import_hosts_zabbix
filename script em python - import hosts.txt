@@ -1,0 +1,174 @@
+import csv
+import requests
+import json
+from io import StringIO
+import sys
+import re
+
+# --- CONFIGURAÇÕES DO AMBIENTE ZABBIX ---
+ZABBIX_API_URL = "http://url/zabbix/api_jsonrpc.php"
+AUTH_TOKEN = "d916390908aapi-token"
+CSV_FILE = "hosts.csv"  
+# ----------------------------------------
+
+# --- DADOS DE INTERFACE E MONITORAMENTO ---
+INTERFACE_TYPE = 2   # 1=Agent, 2=SNMP
+INTERFACE_PORT = 161
+SNMP_COMMUNITY = "public"
+# Versão 2 é o padrão mais comum para SNMP
+SNMP_VERSION = 2     
+PROXY_HOSTID = "0"
+# ------------------------------------------
+
+print("Iniciando importação de hosts via API Zabbix (Python V11 - Correção SNMP)...")
+
+group_id_cache = {}
+request_id = 2
+
+def api_call(method, params, auth=AUTH_TOKEN, url=ZABBIX_API_URL):
+    """Função genérica para fazer chamadas à API Zabbix."""
+    global request_id
+    payload = {
+        "jsonrpc": "2.0",
+        "method": method,
+        "params": params,
+        "auth": auth,
+        "id": request_id
+    }
+    request_id += 1
+    
+    try:
+        response = requests.post(url, json=payload, headers={'Content-Type': 'application/json-rpc'})
+        response.raise_for_status()
+        return response.json()
+    except requests.exceptions.RequestException as e:
+        print(f"   ERRO de Requisição HTTP: {e}")
+        return {"error": {"data": str(e)}}
+
+def get_group_id_and_create_if_missing(group_name):
+    """Busca o ID do grupo, ou o cria se não existir."""
+    if group_name in group_id_cache:
+        return group_id_cache[group_name]
+
+    try:
+        response = api_call("hostgroup.get", {"output": ["groupid"], "filter": {"name": [group_name]}})
+        
+        if "result" in response and response["result"]:
+            group_id = response["result"][0]["groupid"]
+            group_id_cache[group_name] = group_id
+            return group_id
+        
+        # Se não encontrou, tenta criar
+        print(f"   AVISO: Tentando criar o grupo '{group_name}' que não existe no destino.")
+        create_response = api_call("hostgroup.create", {"name": group_name})
+        
+        if "result" in create_response and "groupids" in create_response["result"]:
+            group_id = create_response["result"]["groupids"][0]
+            group_id_cache[group_name] = group_id
+            print(f"   Grupo '{group_name}' criado com ID: {group_id}")
+            return group_id
+        
+        else:
+            error_data = create_response.get("error", {}).get("data", "Erro desconhecido")
+            print(f"   ERRO: Falha ao criar o grupo '{group_name}'. Detalhes: {error_data}. Host será IGNORADO.")
+            return None
+
+    except Exception as e:
+        print(f"   ERRO FATAL no processamento do grupo '{group_name}': {e}")
+        return None
+
+def import_hosts_from_csv():
+    """Lê o CSV e cria os hosts no Zabbix."""
+    try:
+        with open(CSV_FILE, 'r', encoding='latin-1') as file:
+            
+            reader = csv.reader(file, delimiter=',')
+            header = next(reader) # Pula o cabeçalho
+            
+            for row in reader:
+                
+                if len(row) < 7:
+                    if len(row) > 0 and len(row[0]) > 0:
+                         print(f"\n--- ERRO CRÍTICO DE DADOS: Linha pulada ({len(row)} colunas). Hostname: {row[0][:30]} ---")
+                    continue
+                
+                # Funções de limpeza para garantir dados corretos (Mantidas)
+                def clean_field(value):
+                    if isinstance(value, str):
+                        value = value.replace('"', '').replace('\n', '').replace('\r', '').strip()
+                        value = re.sub(r'[\s\x00-\x1F\x7F-\x9F]+', ' ', value).strip()
+                    return value
+
+                # Mapeamento e Limpeza
+                hostname = clean_field(row[0])
+                name = clean_field(row[1])
+                ip_address = clean_field(row[2])
+                group_names_raw = clean_field(row[3])
+                
+                if not hostname:
+                     print("\n--- ERRO DE VALIDAÇÃO: Hostname está vazio. Pulando. ---")
+                     continue
+                     
+                print(f"\n--- Processando Host: {hostname} ({ip_address}) ---")
+                print(f"   DEBUG: Hostname={repr(hostname)} | IP={repr(ip_address)} | Name={repr(name)}")
+
+                # 2. Processar Grupos (separados por pipe '|')
+                group_ids = []
+                groups = [g.strip() for g in group_names_raw.split('|')]
+                
+                for gname in groups:
+                    if gname:
+                        group_id = get_group_id_and_create_if_missing(gname)
+                        if group_id:
+                            group_ids.append({"groupid": group_id})
+                
+                if not group_ids:
+                    print(f"   ERRO DE VALIDAÇÃO: Host '{hostname}' não tem grupos válidos. Pulando.")
+                    continue
+                
+                # 3. Montar a requisição de host.create (CORREÇÃO DE INTERFACE SNMP)
+                host_params = {
+                    "host": hostname,
+                    "name": name,
+                    "proxy_hostid": PROXY_HOSTID,
+                    "interfaces": [
+                        {
+                            "type": INTERFACE_TYPE,
+                            "main": 1,
+                            "useip": 1,
+                            "ip": ip_address,
+                            "dns": "",
+                            "port": str(INTERFACE_PORT),
+                            "details": {
+                                "version": SNMP_VERSION, # <-- CORREÇÃO: Adicionando Versão SNMP
+                                "community": SNMP_COMMUNITY
+                            }
+                        }
+                    ],
+                    "groups": group_ids,
+                }
+
+                # 4. Criar o Host
+                create_response = api_call("host.create", host_params)
+
+                if "error" in create_response:
+                    error_data = create_response["error"].get("data", "Erro desconhecido")
+                    
+                    if "Host with the same name" in error_data:
+                        print(f"   AVISO: Host '{hostname}' já existe. Pulando.")
+                    else:
+                        print(f"   ERRO na Criação do Host: {error_data}")
+                        print("   --- JSON ENVIADO (DEBUG) ---")
+                        print(json.dumps(host_params, indent=4))
+                        print("   -----------------------------")
+                else:
+                    host_id = create_response["result"]["hostids"][0]
+                    print(f"   SUCESSO! Host '{hostname}' criado com ID: {host_id}")
+
+    except FileNotFoundError:
+        print(f"ERRO: O arquivo '{CSV_FILE}' não foi encontrado.")
+    except Exception as e:
+        print(f"Ocorreu um erro inesperado no script: {e}")
+
+if __name__ == "__main__":
+    import_hosts_from_csv()
