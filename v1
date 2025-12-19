@@ -1,3 +1,5 @@
+#Script de auxilio para importação de hosts via linha de comando
+#Autor - Marlon Silva
 import csv
 import requests
 import json
@@ -171,4 +173,5 @@ def import_hosts_from_csv():
         print(f"Ocorreu um erro inesperado no script: {e}")
 
 if __name__ == "__main__":
+
     import_hosts_from_csv()
